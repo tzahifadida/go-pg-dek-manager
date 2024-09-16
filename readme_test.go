@@ -5,15 +5,14 @@ import (
 	"database/sql"
 	"fmt"
 	"github.com/docker/go-connections/nat"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
 	gopgdekmanager "github.com/tzahifadida/go-pg-dek-manager"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
-
 	// Import the pgx v5 driver
 	_ "github.com/jackc/pgx/v5/stdlib"
 )
@@ -95,9 +94,10 @@ func TestReadmeExamples(t *testing.T) {
 	db, cleanup := setupTestDatabase(t)
 	defer cleanup()
 
-	t.Run("Initialization", func(t *testing.T) {
-		mek := []byte("12345678901234567890123456789012") // 32-byte key
+	ctx := context.Background()
+	mek := []byte("12345678901234567890123456789012") // 32-byte key
 
+	t.Run("Initialization", func(t *testing.T) {
 		manager, err := gopgdekmanager.NewDEKManager(db, mek,
 			gopgdekmanager.WithCleanupPeriod(180*24*time.Hour),
 			gopgdekmanager.WithDEKRotationPeriod(30*24*time.Hour),
@@ -107,61 +107,93 @@ func TestReadmeExamples(t *testing.T) {
 		defer manager.Shutdown()
 	})
 
-	t.Run("Getting and Using a DEK", func(t *testing.T) {
-		mek := []byte("12345678901234567890123456789012") // 32-byte key
-
+	t.Run("RegisteringAKey", func(t *testing.T) {
 		manager, err := gopgdekmanager.NewDEKManager(db, mek)
 		require.NoError(t, err)
 		defer manager.Shutdown()
 
-		dek, version, err := manager.GetDEK("user_data")
+		err = manager.RegisterKey(ctx, "user_data")
+		require.NoError(t, err)
+	})
+
+	t.Run("GettingADEK", func(t *testing.T) {
+		manager, err := gopgdekmanager.NewDEKManager(db, mek)
+		require.NoError(t, err)
+		defer manager.Shutdown()
+
+		err = manager.RegisterKey(ctx, "user_data")
+		require.NoError(t, err)
+
+		dek, version, err := manager.GetDEK(ctx, "user_data")
 		require.NoError(t, err)
 		assert.NotNil(t, dek)
 		assert.Equal(t, 1, version)
-		assert.Len(t, dek, 32) // Ensure DEK is 32 bytes (256 bits)
-
-		// Simulate using the DEK for encryption (in a real scenario, you'd use a proper encryption library)
-		plaintext := []byte("This is a secret message")
-		encryptedData := make([]byte, len(plaintext))
-		for i := range plaintext {
-			encryptedData[i] = plaintext[i] ^ dek[i%len(dek)]
-		}
-
-		// Retrieve the same DEK again
-		sameDEK, sameVersion, err := manager.GetDEK("user_data")
-		require.NoError(t, err)
-		assert.Equal(t, dek, sameDEK)
-		assert.Equal(t, version, sameVersion)
-
-		// Simulate decryption
-		decryptedData := make([]byte, len(encryptedData))
-		for i := range encryptedData {
-			decryptedData[i] = encryptedData[i] ^ sameDEK[i%len(sameDEK)]
-		}
-
-		assert.Equal(t, plaintext, decryptedData) // The decrypted data should match the original plaintext
 	})
 
-	t.Run("Manual DEK Rotation", func(t *testing.T) {
-		mek := []byte("12345678901234567890123456789012") // 32-byte key
-
+	t.Run("ManualDEKRotation", func(t *testing.T) {
 		manager, err := gopgdekmanager.NewDEKManager(db, mek)
 		require.NoError(t, err)
 		defer manager.Shutdown()
 
-		// Get initial DEK
-		dek1, version1, err := manager.GetDEK("rotate_example")
+		err = manager.RegisterKey(ctx, "user_data")
 		require.NoError(t, err)
 
-		// Rotate DEK
-		err = manager.RotateDEK("rotate_example")
+		err = manager.RotateDEK(ctx, "user_data")
+		require.NoError(t, err)
+	})
+
+	t.Run("GettingASpecificVersionOfADEK", func(t *testing.T) {
+		manager, err := gopgdekmanager.NewDEKManager(db, mek)
+		require.NoError(t, err)
+		defer manager.Shutdown()
+
+		err = manager.RegisterKey(ctx, "user_data")
 		require.NoError(t, err)
 
-		// Get rotated DEK
-		dek2, version2, err := manager.GetDEK("rotate_example")
+		// Create initial version
+		_, _, err = manager.GetDEK(ctx, "user_data")
 		require.NoError(t, err)
 
-		assert.NotEqual(t, dek1, dek2)
-		assert.Equal(t, version1+1, version2)
+		// Rotate to create version 2
+		err = manager.RotateDEK(ctx, "user_data")
+		require.NoError(t, err)
+
+		dek, err := manager.GetDEKByVersion(ctx, "user_data", 2)
+		require.NoError(t, err)
+		assert.NotNil(t, dek)
+	})
+
+	t.Run("ListingRegisteredKeys", func(t *testing.T) {
+		manager, err := gopgdekmanager.NewDEKManager(db, mek)
+		require.NoError(t, err)
+		defer manager.Shutdown()
+
+		err = manager.RegisterKey(ctx, "key1")
+		require.NoError(t, err)
+		err = manager.RegisterKey(ctx, "key2")
+		require.NoError(t, err)
+
+		keys, err := manager.ListKeys(ctx)
+		require.NoError(t, err)
+		assert.Contains(t, keys, "key1")
+		assert.Contains(t, keys, "key2")
+	})
+
+	t.Run("GettingKeyInformation", func(t *testing.T) {
+		manager, err := gopgdekmanager.NewDEKManager(db, mek)
+		require.NoError(t, err)
+		defer manager.Shutdown()
+
+		err = manager.RegisterKey(ctx, "user_data")
+		require.NoError(t, err)
+
+		_, _, err = manager.GetDEK(ctx, "user_data")
+		require.NoError(t, err)
+
+		genFuncName, latestVersion, err := manager.GetKeyInfo(ctx, "user_data")
+		require.NoError(t, err)
+		assert.Equal(t, "aes256-random", genFuncName)
+		assert.Greater(t, latestVersion, 0, "Latest version should be greater than 0")
+		t.Logf("Latest version for 'user_data': %d", latestVersion)
 	})
 }

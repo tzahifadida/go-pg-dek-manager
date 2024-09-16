@@ -8,13 +8,14 @@
 
 - **Master Encryption Key (MEK) Management**: Secure handling of MEKs, including rotation and recovery.
 - **Data Encryption Key (DEK) Management**: Creation, retrieval, and rotation of DEKs for multiple named keys.
-- **Symmetric DEKs**: Generates secure, symmetric DEKs of 32 bytes (256 bits) in length, suitable for use with AES-256 and other symmetric encryption algorithms.
+- **Flexible DEK Generation**: Supports multiple DEK generation functions (AES-128, AES-192, AES-256) with the ability to add custom functions.
+- **Key Registration**: Separate key registration process, independent of MEK/DEK operations.
 - **Automatic DEK Rotation**: Configurable periodic rotation of DEKs.
 - **Distributed Locking**: Prevents race conditions in distributed environments during key operations.
 - **MEK Recovery**: Support for recovery using older MEKs in emergency scenarios.
 - **Key Versioning**: Maintains versions of both MEKs and DEKs for traceability and backward compatibility.
 - **PostgreSQL Backend**: Utilizes PostgreSQL for secure storage of encrypted keys.
-- **Caching**: In-memory caching of DEKs for improved performance.
+- **Caching**: In-memory caching of DEKs and key-function mappings for improved performance.
 - **Configurable Cleanup**: Automatic cleanup of old, inactive keys after a configurable period.
 
 ## Installation
@@ -29,6 +30,7 @@ go get github.com/tzahifadida/go-pg-dek-manager
 
 ```go
 import (
+    "context"
     "database/sql"
     "github.com/tzahifadida/go-pg-dek-manager"
 )
@@ -50,24 +52,64 @@ if err != nil {
 defer manager.Shutdown()
 ```
 
+### Registering a Key
+
+```go
+ctx := context.Background()
+err := manager.RegisterKey(ctx, "user_data")
+if err != nil {
+    // Handle error
+}
+```
+
 ### Getting a DEK
 
 ```go
-dek, version, err := manager.GetDEK("user_data")
+dek, version, err := manager.GetDEK(ctx, "user_data")
 if err != nil {
     // Handle error
 }
 // Use dek for encryption/decryption
-// Note: dek is a 32-byte symmetric key suitable for AES-256
 ```
 
 ### Manual DEK Rotation
 
 ```go
-err := manager.RotateDEK("user_data")
+err := manager.RotateDEK(ctx, "user_data")
 if err != nil {
     // Handle error
 }
+```
+
+### Getting a Specific Version of a DEK
+
+```go
+dek, err := manager.GetDEKByVersion(ctx, "user_data", 2)
+if err != nil {
+    // Handle error
+}
+// Use dek for decryption of data encrypted with this specific version
+```
+
+### Listing Registered Keys
+
+```go
+keys, err := manager.ListKeys(ctx)
+if err != nil {
+    // Handle error
+}
+// keys is a slice of registered key names
+```
+
+### Getting Key Information
+
+```go
+genFuncName, latestVersion, err := manager.GetKeyInfo(ctx, "user_data")
+if err != nil {
+    // Handle error
+}
+// genFuncName is the name of the generation function used for this key
+// latestVersion is the latest version number of the DEK for this key
 ```
 
 ## Configuration Options
@@ -83,6 +125,9 @@ if err != nil {
 - `WithMaxCacheSize(size int)`: Set the maximum size for the in-memory DEK cache.
 - `WithCacheExpiration(d time.Duration)`: Set the expiration duration for cached DEKs.
 - `WithDriverName(driverName string)`: Set the database driver name.
+- `WithFunction(name string, fn DEKGenerationFunc)`: Add a custom DEK generation function.
+- `WithDefaultGenFuncName(name string)`: Set the default DEK generation function name.
+- `WithMaxKeyFuncCache(size int)`: Set the maximum size for the key-function cache.
 
 ## MEK Handling
 
@@ -97,6 +142,8 @@ if err != nil {
 3. **Monitoring**: Set up monitoring for key operations, especially failed attempts and recoveries.
 4. **Backup**: Regularly backup your database, including the key tables.
 5. **Access Control**: Implement strict access controls to the database and key management functions.
+6. **Key Registration**: Always register keys before attempting to get or rotate DEKs.
+7. **Version Management**: When encrypting data, store the DEK version along with the encrypted data to ensure correct decryption later.
 
 ## Distributed Environment Considerations
 
@@ -107,9 +154,10 @@ if err != nil {
 ## Security Notes
 
 - This library provides key management functionality but does not handle the actual encryption of your data. Use the DEKs retrieved from this library with standard encryption libraries for data encryption.
-- The generated DEKs are 32 bytes (256 bits) long, making them suitable for use with AES-256 and other strong symmetric encryption algorithms.
+- The default DEK generation function produces 32-byte (256-bit) keys, suitable for use with AES-256 and other strong symmetric encryption algorithms.
 - Always use TLS for database connections in production environments.
 - Regularly audit and rotate all keys, including database credentials.
+- When using `GetDEKByVersion`, ensure that you're storing the DEK version along with your encrypted data to facilitate correct decryption.
 
 ## Testing
 

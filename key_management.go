@@ -9,7 +9,6 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -48,14 +47,20 @@ const (
 			"lease_until" TIMESTAMP NOT NULL
 		);
 	`
+	createKeyInfoTableSQL = `
+		CREATE TABLE IF NOT EXISTS "%s"."%s_key_info" (
+			"key_name" TEXT PRIMARY KEY,
+			"gen_func_name" TEXT NOT NULL
+		);
+	`
 )
 
-// MinimalLogger is an interface for minimal logging functionality.
 type MinimalLogger interface {
 	Warn(msg string, args ...any)
 }
 
-// DEKManager handles the management of Data Encryption Keys (DEKs).
+type DEKGenerationFunc func(ctx context.Context) ([]byte, error)
+
 type DEKManager struct {
 	db                    *sqlx.DB
 	mek                   []byte
@@ -77,9 +82,12 @@ type DEKManager struct {
 	logger                MinimalLogger
 	lockLeaseDuration     time.Duration
 	wg                    sync.WaitGroup
+	dekGenFuncs           map[string]DEKGenerationFunc
+	dekGenMutex           sync.RWMutex
+	defaultGenFuncName    string
+	keyFuncCache          *keyFuncCache
 }
 
-// DEKManagerConfig holds configuration options for DEKManager.
 type DEKManagerConfig struct {
 	DB                    *sql.DB
 	MEK                   []byte
@@ -94,131 +102,218 @@ type DEKManagerConfig struct {
 	MaxCacheSize          int
 	CacheExpiration       time.Duration
 	DriverName            string
+	DEKGenFuncs           map[string]DEKGenerationFunc
+	DefaultGenFuncName    string
+	MaxKeyFuncCache       int
 }
 
-// DEKManagerOption is a function type for configuring a DEKManager.
 type DEKManagerOption func(*DEKManagerConfig)
 
-// WithCleanupPeriod sets the period for cleaning up old DEKs.
-//
-// Parameters:
-//   - d: The duration between cleanup operations.
+type cacheItem struct {
+	key       int
+	value     []byte
+	timestamp time.Time
+}
+
+type lruCache struct {
+	capacity int
+	items    map[int]*list.Element
+	list     *list.List
+	mutex    sync.RWMutex
+}
+
+type keyFuncCacheItem struct {
+	key   string
+	value string
+}
+
+type keyFuncCache struct {
+	capacity int
+	items    map[string]*list.Element
+	list     *list.List
+	mutex    sync.RWMutex
+}
+
+func newLRUCache(capacity int) *lruCache {
+	return &lruCache{
+		capacity: capacity,
+		items:    make(map[int]*list.Element),
+		list:     list.New(),
+	}
+}
+
+func (c *lruCache) Get(key int) ([]byte, bool) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	if element, found := c.items[key]; found {
+		c.list.MoveToFront(element)
+		return element.Value.(*cacheItem).value, true
+	}
+	return nil, false
+}
+
+func (c *lruCache) Add(key int, value []byte) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if element, found := c.items[key]; found {
+		c.list.MoveToFront(element)
+		element.Value.(*cacheItem).value = value
+		element.Value.(*cacheItem).timestamp = time.Now()
+		return
+	}
+	if c.list.Len() >= c.capacity {
+		oldest := c.list.Back()
+		if oldest != nil {
+			delete(c.items, oldest.Value.(*cacheItem).key)
+			c.list.Remove(oldest)
+		}
+	}
+	element := c.list.PushFront(&cacheItem{key: key, value: value, timestamp: time.Now()})
+	c.items[key] = element
+}
+
+func (c *lruCache) Remove(key int) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if element, found := c.items[key]; found {
+		delete(c.items, key)
+		c.list.Remove(element)
+	}
+}
+
+func newKeyFuncCache(capacity int) *keyFuncCache {
+	return &keyFuncCache{
+		capacity: capacity,
+		items:    make(map[string]*list.Element),
+		list:     list.New(),
+	}
+}
+
+func (c *keyFuncCache) Get(key string) (string, bool) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	if element, found := c.items[key]; found {
+		c.list.MoveToFront(element)
+		return element.Value.(*keyFuncCacheItem).value, true
+	}
+	return "", false
+}
+
+func (c *keyFuncCache) Add(key, value string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if element, found := c.items[key]; found {
+		c.list.MoveToFront(element)
+		element.Value.(*keyFuncCacheItem).value = value
+		return
+	}
+	if c.list.Len() >= c.capacity {
+		oldest := c.list.Back()
+		if oldest != nil {
+			delete(c.items, oldest.Value.(*keyFuncCacheItem).key)
+			c.list.Remove(oldest)
+		}
+	}
+	element := c.list.PushFront(&keyFuncCacheItem{key: key, value: value})
+	c.items[key] = element
+}
+
+func (c *keyFuncCache) Remove(key string) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if element, found := c.items[key]; found {
+		delete(c.items, key)
+		c.list.Remove(element)
+	}
+}
+
 func WithCleanupPeriod(d time.Duration) DEKManagerOption {
 	return func(c *DEKManagerConfig) {
 		c.CleanupPeriod = &d
 	}
 }
 
-// WithDEKRotationPeriod sets the period for automatic DEK rotation.
-//
-// Parameters:
-//   - d: The duration between DEK rotation operations.
 func WithDEKRotationPeriod(d time.Duration) DEKManagerOption {
 	return func(c *DEKManagerConfig) {
 		c.DEKRotationPeriod = d
 	}
 }
 
-// WithTransitionCheckPeriod sets the period for checking MEK transitions.
-//
-// Parameters:
-//   - d: The duration between MEK transition checks.
 func WithTransitionCheckPeriod(d time.Duration) DEKManagerOption {
 	return func(c *DEKManagerConfig) {
 		c.TransitionCheckPeriod = d
 	}
 }
 
-// WithTablePrefix sets a custom table prefix for database tables.
-//
-// Parameters:
-//   - prefix: The prefix to be used for table names.
 func WithTablePrefix(prefix string) DEKManagerOption {
 	return func(c *DEKManagerConfig) {
 		c.TablePrefix = prefix
 	}
 }
 
-// WithSchemaName sets a custom schema name for database tables.
-//
-// Parameters:
-//   - schema: The schema name to be used.
 func WithSchemaName(schema string) DEKManagerOption {
 	return func(c *DEKManagerConfig) {
 		c.SchemaName = schema
 	}
 }
 
-// WithLogger provides a custom logger implementation.
-//
-// Parameters:
-//   - logger: The logger implementing the MinimalLogger interface.
 func WithLogger(logger MinimalLogger) DEKManagerOption {
 	return func(c *DEKManagerConfig) {
 		c.Logger = logger
 	}
 }
 
-// WithLockLeaseDuration sets the duration for distributed locks.
-//
-// Parameters:
-//   - d: The duration for which a lock is considered valid.
 func WithLockLeaseDuration(d time.Duration) DEKManagerOption {
 	return func(c *DEKManagerConfig) {
 		c.LockLeaseDuration = d
 	}
 }
 
-// WithOldMEK provides an old MEK for transition scenarios.
-//
-// Parameters:
-//   - oldMEK: The old Master Encryption Key as a byte slice.
 func WithOldMEK(oldMEK []byte) DEKManagerOption {
 	return func(c *DEKManagerConfig) {
 		c.OldMEK = oldMEK
 	}
 }
 
-// WithMaxCacheSize sets the maximum size for the in-memory DEK cache.
-//
-// Parameters:
-//   - size: The maximum number of DEKs to cache in memory.
 func WithMaxCacheSize(size int) DEKManagerOption {
 	return func(c *DEKManagerConfig) {
 		c.MaxCacheSize = size
 	}
 }
 
-// WithCacheExpiration sets the expiration duration for cached DEKs.
-//
-// Parameters:
-//   - d: The duration after which a cached DEK is considered expired.
 func WithCacheExpiration(d time.Duration) DEKManagerOption {
 	return func(c *DEKManagerConfig) {
 		c.CacheExpiration = d
 	}
 }
 
-// WithDriverName sets the database driver name.
-//
-// Parameters:
-//   - driverName: The name of the database driver to use.
 func WithDriverName(driverName string) DEKManagerOption {
 	return func(c *DEKManagerConfig) {
 		c.DriverName = driverName
 	}
 }
 
-// NewDEKManager creates a new DEK manager with the given database connection and MEK.
-//
-// Parameters:
-//   - db: A sql.DB object representing the database connection.
-//   - mek: The Master Encryption Key as a byte slice (must be 32 bytes).
-//   - options: Optional configuration options for the DEK manager.
-//
-// Returns:
-//   - *DEKManager: A pointer to the created DEKManager.
-//   - error: An error if the creation fails.
+func WithFunction(name string, fn DEKGenerationFunc) DEKManagerOption {
+	return func(c *DEKManagerConfig) {
+		if c.DEKGenFuncs == nil {
+			c.DEKGenFuncs = make(map[string]DEKGenerationFunc)
+		}
+		c.DEKGenFuncs[name] = fn
+	}
+}
+
+func WithDefaultGenFuncName(name string) DEKManagerOption {
+	return func(c *DEKManagerConfig) {
+		c.DefaultGenFuncName = name
+	}
+}
+
+func WithMaxKeyFuncCache(size int) DEKManagerOption {
+	return func(c *DEKManagerConfig) {
+		c.MaxKeyFuncCache = size
+	}
+}
+
 func NewDEKManager(db *sql.DB, mek []byte, options ...DEKManagerOption) (*DEKManager, error) {
 	if len(mek) != 32 {
 		return nil, fmt.Errorf("invalid MEK size: must be 32 bytes")
@@ -229,13 +324,16 @@ func NewDEKManager(db *sql.DB, mek []byte, options ...DEKManagerOption) (*DEKMan
 		MEK:                   mek,
 		SchemaName:            "public",
 		TablePrefix:           "dek_store",
-		DEKRotationPeriod:     90 * 24 * time.Hour, // 3 months default
-		TransitionCheckPeriod: time.Hour,           // 1 hour default
+		DEKRotationPeriod:     90 * 24 * time.Hour,
+		TransitionCheckPeriod: time.Hour,
 		LockLeaseDuration:     3 * time.Minute,
 		Logger:                newDefaultLogger(),
-		MaxCacheSize:          1000,           // Default cache size
-		CacheExpiration:       24 * time.Hour, // Default cache expiration (24 hours)
-		DriverName:            "pgx",          // Default driver name
+		MaxCacheSize:          1000,
+		CacheExpiration:       24 * time.Hour,
+		DriverName:            "pgx",
+		DEKGenFuncs:           make(map[string]DEKGenerationFunc),
+		DefaultGenFuncName:    "aes256-random",
+		MaxKeyFuncCache:       1000,
 	}
 
 	for _, option := range options {
@@ -262,6 +360,27 @@ func NewDEKManager(db *sql.DB, mek []byte, options ...DEKManagerOption) (*DEKMan
 		cancel:                cancel,
 		logger:                config.Logger,
 		lockLeaseDuration:     config.LockLeaseDuration,
+		dekGenFuncs:           make(map[string]DEKGenerationFunc),
+		defaultGenFuncName:    config.DefaultGenFuncName,
+		keyFuncCache:          newKeyFuncCache(config.MaxKeyFuncCache),
+	}
+
+	// Add default DEK generation functions
+	defaultFuncs := map[string]DEKGenerationFunc{
+		"aes256-random": generateAES256RandomDEK,
+		"aes192-random": generateAES192RandomDEK,
+		"aes128-random": generateAES128RandomDEK,
+	}
+
+	for name, fn := range defaultFuncs {
+		if _, exists := config.DEKGenFuncs[name]; !exists {
+			config.DEKGenFuncs[name] = fn
+		}
+	}
+
+	// Copy DEK generation functions to the manager
+	for name, fn := range config.DEKGenFuncs {
+		manager.dekGenFuncs[name] = fn
 	}
 
 	if err := manager.initializeDB(); err != nil {
@@ -272,7 +391,7 @@ func NewDEKManager(db *sql.DB, mek []byte, options ...DEKManagerOption) (*DEKMan
 		return nil, fmt.Errorf("failed to initialize or validate MEK: %w", err)
 	}
 
-	manager.wg.Add(2) // Add wait group for goroutines
+	manager.wg.Add(2)
 	go manager.periodicCleanup()
 	go manager.periodicDEKRotation()
 
@@ -314,6 +433,10 @@ func (dm *DEKManager) initializeDB() error {
 	if err != nil {
 		return fmt.Errorf("failed to create lock table: %w", err)
 	}
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(createKeyInfoTableSQL, dm.schemaName, dm.tablePrefix))
+	if err != nil {
+		return fmt.Errorf("failed to create key_info table: %w", err)
+	}
 
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit transaction: %w", err)
@@ -341,9 +464,7 @@ func (dm *DEKManager) initializeOrValidateMEK() error {
 	`, dm.schemaName, dm.tablePrefix, dm.schemaName, dm.tablePrefix), mekHash).Scan(&id, &isCurrentMEK)
 
 	if err == sql.ErrNoRows {
-		// MEK not found in the database
 		if dm.oldMEK != nil {
-			// We're transitioning to a new MEK
 			var oldMEKID int
 			err = tx.QueryRowContext(ctx, fmt.Sprintf(`
 				SELECT id FROM "%s"."%s_mek"
@@ -353,7 +474,6 @@ func (dm *DEKManager) initializeOrValidateMEK() error {
 				return fmt.Errorf("failed to find old MEK: %w", err)
 			}
 
-			// Check if old MEK is the current MEK
 			var isOldMEKCurrent bool
 			err = tx.QueryRowContext(ctx, fmt.Sprintf(`
 				SELECT id = (SELECT MAX(id) FROM "%s"."%s_mek")
@@ -365,15 +485,13 @@ func (dm *DEKManager) initializeOrValidateMEK() error {
 			}
 
 			if isOldMEKCurrent {
-				// Old MEK is current, we can create the new MEK
 				if err := dm.createNewMEKEntry(ctx, tx, mekHash); err != nil {
-					return err
+					return fmt.Errorf("failed to create new MEK entry: %w", err)
 				}
 			} else {
-				return errors.New("old MEK is not the current MEK")
+				return fmt.Errorf("old MEK is not the current MEK")
 			}
 		} else {
-			// No old MEK provided, check if there are any existing DEKs
 			var count int
 			err = tx.QueryRowContext(ctx, fmt.Sprintf(`
 				SELECT COUNT(*) FROM "%s"."%s_dek"
@@ -382,12 +500,11 @@ func (dm *DEKManager) initializeOrValidateMEK() error {
 				return fmt.Errorf("failed to check existing DEKs: %w", err)
 			}
 			if count > 0 {
-				return errors.New("provided MEK does not match existing encrypted DEKs")
+				return fmt.Errorf("provided MEK does not match existing encrypted DEKs")
 			}
 
-			// No existing DEKs, create a new MEK entry
 			if err := dm.createNewMEKEntry(ctx, tx, mekHash); err != nil {
-				return err
+				return fmt.Errorf("failed to create new MEK entry: %w", err)
 			}
 		}
 	} else if err != nil {
@@ -410,10 +527,10 @@ func (dm *DEKManager) initializeOrValidateMEK() error {
 
 func (dm *DEKManager) createNewMEKEntry(ctx context.Context, tx *sql.Tx, mekHash string) error {
 	err := tx.QueryRowContext(ctx, fmt.Sprintf(`
-            		INSERT INTO "%s"."%s_mek" (mek_hash) 
-            		VALUES ($1) 
-            		RETURNING id
-            	`, dm.schemaName, dm.tablePrefix), mekHash).Scan(&dm.currentMEKID)
+		INSERT INTO "%s"."%s_mek" (mek_hash) 
+		VALUES ($1) 
+		RETURNING id
+	`, dm.schemaName, dm.tablePrefix), mekHash).Scan(&dm.currentMEKID)
 
 	if err != nil {
 		return fmt.Errorf("failed to create new MEK entry: %w", err)
@@ -433,9 +550,9 @@ func (dm *DEKManager) initializeOldMEK() error {
 
 	oldMEKHash := dm.hashMEK(dm.oldMEK)
 	err = tx.QueryRowContext(ctx, fmt.Sprintf(`
-            		SELECT id FROM "%s"."%s_mek"
-            		WHERE mek_hash = $1
-            	`, dm.schemaName, dm.tablePrefix), oldMEKHash).Scan(&dm.oldMEKID)
+		SELECT id FROM "%s"."%s_mek"
+		WHERE mek_hash = $1
+	`, dm.schemaName, dm.tablePrefix), oldMEKHash).Scan(&dm.oldMEKID)
 
 	if err != nil {
 		return fmt.Errorf("failed to find old MEK: %w", err)
@@ -453,130 +570,27 @@ func (dm *DEKManager) hashMEK(mek []byte) string {
 	return base64.StdEncoding.EncodeToString(hash[:])
 }
 
-func (dm *DEKManager) transitionToNewMEK() error {
-	dm.logger.Warn("Starting MEK transition")
-
-	tx, err := dm.db.BeginTxx(dm.ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() {
-		if p := recover(); p != nil {
-			tx.Rollback()
-			panic(p)
-		}
-	}()
-
-	// Fetch old DEKs
-	oldDEKs, err := dm.fetchOldDEKs(tx)
-	if err != nil {
-		tx.Rollback()
-		return fmt.Errorf("failed to fetch old DEKs: %w", err)
-	}
-
-	// Create new DEK versions
-	for _, oldDEK := range oldDEKs {
-		if err := dm.createNewDEKVersionWithinTx(tx, oldDEK.keyName, oldDEK.encryptedDEK, oldDEK.version); err != nil {
-			tx.Rollback()
-			return fmt.Errorf("failed to create new DEK version for key %s: %w", oldDEK.keyName, err)
-		}
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	dm.logger.Warn("MEK transition completed successfully")
-	return nil
-}
-
-type oldDEKInfo struct {
-	keyName      string
-	encryptedDEK string
-	version      int
-}
-
-func (dm *DEKManager) fetchOldDEKs(tx *sqlx.Tx) ([]oldDEKInfo, error) {
-	query := fmt.Sprintf(`
-            		SELECT key_name, encrypted_dek, version
-            		FROM "%s"."%s_dek" 
-            		WHERE mek_id = $1
-            		ORDER BY key_name, version
-            	`, dm.schemaName, dm.tablePrefix)
-
-	rows, err := tx.QueryxContext(dm.ctx, query, dm.oldMEKID)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query old DEKs: %w", err)
-	}
-	defer rows.Close()
-
-	var oldDEKs []oldDEKInfo
-	for rows.Next() {
-		var dek oldDEKInfo
-		if err := rows.Scan(&dek.keyName, &dek.encryptedDEK, &dek.version); err != nil {
-			return nil, fmt.Errorf("failed to scan old DEK: %w", err)
-		}
-		oldDEKs = append(oldDEKs, dek)
-	}
-
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("error iterating over old DEKs: %w", err)
-	}
-
-	return oldDEKs, nil
-}
-
-func (dm *DEKManager) createNewDEKVersionWithinTx(tx *sqlx.Tx, keyName, oldEncryptedDEK string, oldVersion int) error {
-	dm.logger.Warn(fmt.Sprintf("Creating new DEK version for key: %s, version: %d", keyName, oldVersion))
-
-	// Decrypt DEK with old MEK
-	dek, err := dm.decryptDEKWithMEK(dm.oldMEK, oldEncryptedDEK)
-	if err != nil {
-		return fmt.Errorf("failed to decrypt old DEK: %w", err)
-	}
-
-	// Re-encrypt DEK with new MEK
-	newEncryptedDEK, err := dm.encryptDEK(dek)
-	if err != nil {
-		return fmt.Errorf("failed to re-encrypt DEK: %w", err)
-	}
-
-	// Store new DEK version
-	query := fmt.Sprintf(`
-            		INSERT INTO "%s"."%s_dek" (key_name, encrypted_dek, mek_id, version)
-            		VALUES ($1, $2, $3, $4)
-            		ON CONFLICT (key_name, version, mek_id) DO NOTHING
-            	`, dm.schemaName, dm.tablePrefix)
-
-	_, err = tx.ExecContext(dm.ctx, query, keyName, newEncryptedDEK, dm.currentMEKID, oldVersion)
-	if err != nil {
-		return fmt.Errorf("failed to store re-encrypted DEK: %w", err)
-	}
-
-	dm.logger.Warn(fmt.Sprintf("Successfully created new DEK version for key: %s, version: %d", keyName, oldVersion))
-	return nil
-}
-
-// GetDEK retrieves or creates a DEK for the given key name.
-//
-// Parameters:
-//   - keyName: The name of the key to retrieve or create.
-//
-// Returns:
-//   - []byte: The DEK as a byte slice.
-//   - int: The version of the DEK.
-//   - error: An error if the operation fails.
-func (dm *DEKManager) GetDEK(keyName string) ([]byte, int, error) {
+func (dm *DEKManager) GetDEK(ctx context.Context, keyName string) ([]byte, int, error) {
 	if !dm.isCurrentMEK {
 		dm.logger.Warn("Using an old version of MEK to retrieve DEK.", "key_name", keyName)
 	}
 
-	// Try to get from cache first
+	// Check DEK cache first
 	if cachedDEK, cachedVersion, found := dm.getFromCache(keyName); found {
 		return cachedDEK, cachedVersion, nil
 	}
 
-	ctx := context.Background()
+	// Check key-function cache
+	genFuncName, found := dm.keyFuncCache.Get(keyName)
+	if !found {
+		var err error
+		genFuncName, err = dm.getGenFuncNameFromDB(ctx, keyName)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to get generation function name: %w", err)
+		}
+		dm.keyFuncCache.Add(keyName, genFuncName)
+	}
+
 	tx, err := dm.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to begin transaction: %w", err)
@@ -589,18 +603,17 @@ func (dm *DEKManager) GetDEK(keyName string) ([]byte, int, error) {
 	var mekID int
 
 	err = tx.QueryRowContext(ctx, fmt.Sprintf(`
-            		SELECT id, version, encrypted_dek, mek_id 
-            		FROM "%s"."%s_dek" 
-            		WHERE key_name = $1 AND mek_id = $2
-            		ORDER BY version DESC LIMIT 1
-            	`, dm.schemaName, dm.tablePrefix), keyName, dm.currentMEKID).Scan(&id, &version, &encryptedDEK, &mekID)
+		SELECT id, version, encrypted_dek, mek_id 
+		FROM "%s"."%s_dek" 
+		WHERE key_name = $1 AND mek_id = $2
+		ORDER BY version DESC LIMIT 1
+	`, dm.schemaName, dm.tablePrefix), keyName, dm.currentMEKID).Scan(&id, &version, &encryptedDEK, &mekID)
 
 	if err == sql.ErrNoRows {
 		if !dm.isCurrentMEK {
-			return nil, 0, errors.New("cannot create new DEK with old MEK")
+			return nil, 0, fmt.Errorf("cannot create new DEK with old MEK")
 		}
-		// No DEK found, generate and store a new one within this transaction
-		dek, newVersion, err := dm.generateAndStoreDEKWithinTx(ctx, tx, keyName)
+		dek, newVersion, err := dm.generateAndStoreDEKWithinTx(ctx, tx, keyName, genFuncName)
 		if err != nil {
 			return nil, 0, fmt.Errorf("failed to generate and store new DEK: %w", err)
 		}
@@ -622,16 +635,39 @@ func (dm *DEKManager) GetDEK(keyName string) ([]byte, int, error) {
 		return nil, 0, fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	// Add to cache
 	dm.addToCache(keyName, version, dek)
 
 	return dek, version, nil
 }
 
-func (dm *DEKManager) generateAndStoreDEKWithinTx(ctx context.Context, tx *sql.Tx, keyName string) ([]byte, int, error) {
-	dek := make([]byte, 32)
-	if _, err := io.ReadFull(rand.Reader, dek); err != nil {
-		return nil, 0, fmt.Errorf("failed to generate random DEK: %w", err)
+func (dm *DEKManager) getGenFuncNameFromDB(ctx context.Context, keyName string) (string, error) {
+	var genFuncName string
+	err := dm.db.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT gen_func_name FROM "%s"."%s_key_info"
+		WHERE key_name = $1
+	`, dm.schemaName, dm.tablePrefix), keyName).Scan(&genFuncName)
+
+	if err == sql.ErrNoRows {
+		return "", fmt.Errorf("key '%s' not registered", keyName)
+	} else if err != nil {
+		return "", fmt.Errorf("failed to query key info: %w", err)
+	}
+
+	return genFuncName, nil
+}
+
+func (dm *DEKManager) generateAndStoreDEKWithinTx(ctx context.Context, tx *sql.Tx, keyName, genFuncName string) ([]byte, int, error) {
+	dm.dekGenMutex.RLock()
+	genFunc, exists := dm.dekGenFuncs[genFuncName]
+	dm.dekGenMutex.RUnlock()
+
+	if !exists {
+		return nil, 0, fmt.Errorf("DEK generation function '%s' not registered", genFuncName)
+	}
+
+	dek, err := genFunc(ctx)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to generate DEK: %w", err)
 	}
 
 	encryptedDEK, err := dm.encryptDEK(dek)
@@ -641,12 +677,12 @@ func (dm *DEKManager) generateAndStoreDEKWithinTx(ctx context.Context, tx *sql.T
 
 	var version int
 	err = tx.QueryRowContext(ctx, fmt.Sprintf(`
-            		INSERT INTO "%s"."%s_dek" (version, key_name, encrypted_dek, mek_id) 
-            		VALUES (
-            			(SELECT COALESCE(MAX(version), 0) + 1 FROM "%s"."%s_dek" WHERE key_name = $1),
-            			$1, $2, $3
-            		) RETURNING version
-            	`, dm.schemaName, dm.tablePrefix, dm.schemaName, dm.tablePrefix), keyName, encryptedDEK, dm.currentMEKID).Scan(&version)
+		INSERT INTO "%s"."%s_dek" (version, key_name, encrypted_dek, mek_id) 
+		VALUES (
+			(SELECT COALESCE(MAX(version), 0) + 1 FROM "%s"."%s_dek" WHERE key_name = $1),
+			$1, $2, $3
+		) RETURNING version
+	`, dm.schemaName, dm.tablePrefix, dm.schemaName, dm.tablePrefix), keyName, encryptedDEK, dm.currentMEKID).Scan(&version)
 
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to insert new DEK: %w", err)
@@ -708,19 +744,116 @@ func (dm *DEKManager) decryptDEKWithMEK(mek []byte, encryptedDEK string) ([]byte
 	return plaintext, nil
 }
 
-// RotateDEK rotates the DEK for the given key name.
-//
-// Parameters:
-//   - keyName: The name of the key to rotate.
-//
-// Returns:
-//   - error: An error if the rotation fails.
-func (dm *DEKManager) RotateDEK(keyName string) error {
-	if !dm.isCurrentMEK {
-		return errors.New("cannot rotate DEK with an old version of MEK")
+func (dm *DEKManager) RegisterKeyWithFunction(ctx context.Context, keyName, genFuncName string) error {
+	dm.dekGenMutex.RLock()
+	_, exists := dm.dekGenFuncs[genFuncName]
+	dm.dekGenMutex.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("DEK generation function '%s' not registered", genFuncName)
 	}
 
-	ctx := context.Background()
+	tx, err := dm.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var existingFuncName string
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT gen_func_name FROM "%s"."%s_key_info"
+		WHERE key_name = $1
+	`, dm.schemaName, dm.tablePrefix), keyName).Scan(&existingFuncName)
+
+	if err == nil {
+		// Key already exists
+		if existingFuncName != genFuncName {
+			return fmt.Errorf("key '%s' already registered with a different function: %s", keyName, existingFuncName)
+		}
+		// Key exists with the same function, this is a successful idempotent operation
+		return tx.Commit()
+	} else if err != sql.ErrNoRows {
+		return fmt.Errorf("failed to check existing key: %w", err)
+	}
+
+	// Key doesn't exist, insert new entry
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO "%s"."%s_key_info" (key_name, gen_func_name)
+		VALUES ($1, $2)
+	`, dm.schemaName, dm.tablePrefix), keyName, genFuncName)
+
+	if err != nil {
+		return fmt.Errorf("failed to register key: %w", err)
+	}
+
+	return tx.Commit()
+}
+
+func (dm *DEKManager) RegisterKey(ctx context.Context, keyName string) error {
+	return dm.RegisterKeyWithFunction(ctx, keyName, dm.defaultGenFuncName)
+}
+
+func (dm *DEKManager) RemoveKey(ctx context.Context, keyName string) error {
+	tx, err := dm.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Remove from DEKs table
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		DELETE FROM "%s"."%s_dek"
+		WHERE key_name = $1
+	`, dm.schemaName, dm.tablePrefix), keyName)
+	if err != nil {
+		return fmt.Errorf("failed to remove DEKs for key '%s': %w", keyName, err)
+	}
+
+	// Remove from key_info table
+	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		DELETE FROM "%s"."%s_key_info"
+		WHERE key_name = $1
+	`, dm.schemaName, dm.tablePrefix), keyName)
+	if err != nil {
+		return fmt.Errorf("failed to remove key info for key '%s': %w", keyName, err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("key '%s' not found", keyName)
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	// Remove from DEK cache
+	dm.removeFromCache(keyName)
+
+	// Remove from key-function cache
+	dm.keyFuncCache.Remove(keyName)
+
+	dm.logger.Warn("Key removed successfully", "key_name", keyName)
+
+	return nil
+}
+
+func (dm *DEKManager) removeFromCache(keyName string) {
+	dm.cacheMutex.Lock()
+	defer dm.cacheMutex.Unlock()
+	delete(dm.caches, keyName)
+}
+
+func (dm *DEKManager) RotateDEK(ctx context.Context, keyName string) error {
+	if !dm.isCurrentMEK {
+		return fmt.Errorf("cannot rotate DEK with an old version of MEK")
+	}
+
 	tx, err := dm.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
@@ -733,41 +866,44 @@ func (dm *DEKManager) RotateDEK(keyName string) error {
 		return fmt.Errorf("failed to acquire lock: %w", err)
 	}
 	if !locked {
-		return errors.New("failed to acquire lock for DEK rotation")
+		return fmt.Errorf("failed to acquire lock for DEK rotation")
 	}
 
-	// Use a named return value to handle errors and lock release
 	var rotationErr error
 	defer func() {
 		unlockErr := dm.releaseLock(ctx, tx, lockName)
 		if unlockErr != nil {
 			if rotationErr != nil {
-				// If there was already an error, log the unlock error
 				dm.logger.Warn("Failed to release lock after error", "error", unlockErr)
 			} else {
-				// If there wasn't an error yet, set the unlock error as the return error
 				rotationErr = fmt.Errorf("failed to release lock: %w", unlockErr)
 			}
 		}
 
 		if rotationErr == nil {
-			// Only commit if there were no errors
 			if commitErr := tx.Commit(); commitErr != nil {
 				rotationErr = fmt.Errorf("failed to commit transaction: %w", commitErr)
 			}
 		}
 	}()
 
-	dek, version, err := dm.generateAndStoreDEKWithinTx(ctx, tx, keyName)
+	var genFuncName string
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT gen_func_name FROM "%s"."%s_key_info"
+		WHERE key_name = $1
+	`, dm.schemaName, dm.tablePrefix), keyName).Scan(&genFuncName)
+
+	if err != nil {
+		rotationErr = fmt.Errorf("failed to get generation function for key '%s': %w", keyName, err)
+		return rotationErr
+	}
+
+	dek, version, err := dm.generateAndStoreDEKWithinTx(ctx, tx, keyName, genFuncName)
 	if err != nil {
 		rotationErr = fmt.Errorf("failed to generate and store new DEK: %w", err)
 		return rotationErr
 	}
 
-	// If we reach here, the rotation was successful
-	// The deferred function will handle committing and potential errors
-
-	// Add the latest version to the cache if everything was successful
 	if rotationErr == nil {
 		dm.addToCache(keyName, version, dek)
 	}
@@ -806,6 +942,97 @@ func (dm *DEKManager) releaseLock(ctx context.Context, tx *sql.Tx, lockName stri
 	return nil
 }
 
+func (dm *DEKManager) rotateAllDEKs() error {
+	ctx := context.Background()
+	tx, err := dm.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
+		SELECT key_name, gen_func_name
+		FROM "%s"."%s_key_info"
+	`, dm.schemaName, dm.tablePrefix))
+	if err != nil {
+		return fmt.Errorf("failed to query existing keys: %w", err)
+	}
+	defer rows.Close()
+
+	var keysToRotate []struct {
+		keyName     string
+		genFuncName string
+	}
+
+	for rows.Next() {
+		var keyName, genFuncName string
+		if err := rows.Scan(&keyName, &genFuncName); err != nil {
+			return fmt.Errorf("failed to scan key info: %w", err)
+		}
+		keysToRotate = append(keysToRotate, struct {
+			keyName     string
+			genFuncName string
+		}{keyName, genFuncName})
+	}
+
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("error iterating over key names: %w", err)
+	}
+
+	for _, key := range keysToRotate {
+		dm.dekGenMutex.RLock()
+		_, exists := dm.dekGenFuncs[key.genFuncName]
+		dm.dekGenMutex.RUnlock()
+
+		if !exists {
+			err := fmt.Errorf("unregistered function for key during rotation")
+			dm.logger.Warn("Rotation failed due to unregistered function",
+				"key_name", key.keyName,
+				"gen_func_name", key.genFuncName,
+				"error", err)
+			return err
+		}
+
+		if err := dm.rotateDEKWithinTx(ctx, tx, key.keyName, key.genFuncName); err != nil {
+			dm.logger.Warn("Error rotating DEK",
+				"key_name", key.keyName,
+				"error", err)
+			return fmt.Errorf("failed to rotate DEK for key '%s': %w", key.keyName, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
+
+func (dm *DEKManager) rotateDEKWithinTx(ctx context.Context, tx *sql.Tx, keyName, genFuncName string) error {
+	lockName := fmt.Sprintf("dek_rotation_%s", keyName)
+	locked, err := dm.acquireLock(ctx, tx, lockName)
+	if err != nil {
+		return fmt.Errorf("failed to acquire lock: %w", err)
+	}
+	if !locked {
+		return fmt.Errorf("failed to acquire lock for DEK rotation")
+	}
+
+	defer func() {
+		if unlockErr := dm.releaseLock(ctx, tx, lockName); unlockErr != nil {
+			dm.logger.Warn("Failed to release lock after rotation", "error", unlockErr)
+		}
+	}()
+
+	dek, version, err := dm.generateAndStoreDEKWithinTx(ctx, tx, keyName, genFuncName)
+	if err != nil {
+		return fmt.Errorf("failed to generate and store new DEK: %w", err)
+	}
+
+	dm.addToCache(keyName, version, dek)
+	return nil
+}
+
 func (dm *DEKManager) periodicDEKRotation() {
 	defer dm.wg.Done()
 	ticker := time.NewTicker(dm.dekRotationPeriod)
@@ -821,45 +1048,6 @@ func (dm *DEKManager) periodicDEKRotation() {
 			}
 		}
 	}
-}
-
-func (dm *DEKManager) rotateAllDEKs() error {
-	ctx := context.Background()
-	tx, err := dm.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	rows, err := tx.QueryContext(ctx, fmt.Sprintf(`
-		SELECT DISTINCT key_name 
-		FROM "%s"."%s_dek"
-		WHERE mek_id = $1
-	`, dm.schemaName, dm.tablePrefix), dm.currentMEKID)
-	if err != nil {
-		return fmt.Errorf("failed to query existing key names: %w", err)
-	}
-	defer rows.Close()
-
-	for rows.Next() {
-		var keyName string
-		if err := rows.Scan(&keyName); err != nil {
-			return fmt.Errorf("failed to scan key name: %w", err)
-		}
-		if err := dm.RotateDEK(keyName); err != nil {
-			dm.logger.Warn("Error rotating DEK", "key_name", keyName, "error", err)
-		}
-	}
-
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("error iterating over key names: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
 }
 
 func (dm *DEKManager) periodicCleanup() {
@@ -891,7 +1079,6 @@ func (dm *DEKManager) cleanupOldDEKs() error {
 	}
 	defer tx.Rollback()
 
-	// Exclude current MEK and old MEK (if present) from cleanup
 	excludedMEKs := []int{dm.currentMEKID}
 	if dm.oldMEKID != 0 {
 		excludedMEKs = append(excludedMEKs, dm.oldMEKID)
@@ -921,37 +1108,6 @@ func (dm *DEKManager) cleanupOldDEKs() error {
 	return nil
 }
 
-// RemoveDEKs removes DEKs for the given key name up to the specified version.
-//
-// Parameters:
-//   - keyName: The name of the key to remove DEKs for.
-//   - upToVersion: The maximum version (inclusive) to remove.
-//
-// Returns:
-//   - error: An error if the removal fails.
-func (dm *DEKManager) RemoveDEKs(keyName string, upToVersion int) error {
-	ctx := context.Background()
-	tx, err := dm.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
-		DELETE FROM "%s"."%s_dek"
-		WHERE key_name = $1 AND version <= $2
-	`, dm.schemaName, dm.tablePrefix), keyName, upToVersion)
-	if err != nil {
-		return fmt.Errorf("failed to remove DEKs: %w", err)
-	}
-
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	return nil
-}
-
 func (dm *DEKManager) periodicTransitionCheck() {
 	defer dm.wg.Done()
 	ticker := time.NewTicker(dm.transitionCheckPeriod)
@@ -971,16 +1127,103 @@ func (dm *DEKManager) periodicTransitionCheck() {
 	}
 }
 
-type lruCache struct {
-	keys     map[int]*list.Element
-	list     *list.List
-	capacity int
+func (dm *DEKManager) transitionToNewMEK() error {
+	dm.logger.Warn("Starting MEK transition")
+
+	tx, err := dm.db.BeginTxx(dm.ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			tx.Rollback()
+			panic(p)
+		}
+	}()
+
+	oldDEKs, err := dm.fetchOldDEKs(tx)
+	if err != nil {
+		tx.Rollback()
+		return fmt.Errorf("failed to fetch old DEKs: %w", err)
+	}
+
+	for _, oldDEK := range oldDEKs {
+		if err := dm.createNewDEKVersionWithinTx(tx, oldDEK.keyName, oldDEK.encryptedDEK, oldDEK.version); err != nil {
+			tx.Rollback()
+			return fmt.Errorf("failed to create new DEK version for key %s: %w", oldDEK.keyName, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	dm.logger.Warn("MEK transition completed successfully")
+	return nil
 }
 
-type cacheItem struct {
-	key       int
-	value     []byte
-	timestamp time.Time
+type oldDEKInfo struct {
+	keyName      string
+	encryptedDEK string
+	version      int
+}
+
+func (dm *DEKManager) fetchOldDEKs(tx *sqlx.Tx) ([]oldDEKInfo, error) {
+	query := fmt.Sprintf(`
+        SELECT key_name, encrypted_dek, version
+		FROM "%s"."%s_dek" 
+		WHERE mek_id = $1
+		ORDER BY key_name, version
+	`, dm.schemaName, dm.tablePrefix)
+
+	rows, err := tx.QueryxContext(dm.ctx, query, dm.oldMEKID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query old DEKs: %w", err)
+	}
+	defer rows.Close()
+
+	var oldDEKs []oldDEKInfo
+	for rows.Next() {
+		var dek oldDEKInfo
+		if err := rows.Scan(&dek.keyName, &dek.encryptedDEK, &dek.version); err != nil {
+			return nil, fmt.Errorf("failed to scan old DEK: %w", err)
+		}
+		oldDEKs = append(oldDEKs, dek)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating over old DEKs: %w", err)
+	}
+
+	return oldDEKs, nil
+}
+
+func (dm *DEKManager) createNewDEKVersionWithinTx(tx *sqlx.Tx, keyName, oldEncryptedDEK string, oldVersion int) error {
+	dm.logger.Warn(fmt.Sprintf("Creating new DEK version for key: %s, version: %d", keyName, oldVersion))
+
+	dek, err := dm.decryptDEKWithMEK(dm.oldMEK, oldEncryptedDEK)
+	if err != nil {
+		return fmt.Errorf("failed to decrypt old DEK: %w", err)
+	}
+
+	newEncryptedDEK, err := dm.encryptDEK(dek)
+	if err != nil {
+		return fmt.Errorf("failed to re-encrypt DEK: %w", err)
+	}
+
+	query := fmt.Sprintf(`
+		INSERT INTO "%s"."%s_dek" (key_name, encrypted_dek, mek_id, version)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (key_name, version, mek_id) DO NOTHING
+	`, dm.schemaName, dm.tablePrefix)
+
+	_, err = tx.ExecContext(dm.ctx, query, keyName, newEncryptedDEK, dm.currentMEKID, oldVersion)
+	if err != nil {
+		return fmt.Errorf("failed to store re-encrypted DEK: %w", err)
+	}
+
+	dm.logger.Warn(fmt.Sprintf("Successfully created new DEK version for key: %s, version: %d", keyName, oldVersion))
+	return nil
 }
 
 func (dm *DEKManager) getFromCache(keyName string) ([]byte, int, bool) {
@@ -1006,14 +1249,14 @@ func (dm *DEKManager) addToCache(keyName string, version int, dek []byte) {
 	cache, ok := dm.caches[keyName]
 	if !ok {
 		cache = &lruCache{
-			keys:     make(map[int]*list.Element),
+			items:    make(map[int]*list.Element),
 			list:     list.New(),
 			capacity: dm.maxCacheSize,
 		}
 		dm.caches[keyName] = cache
 	}
 
-	if elem, exists := cache.keys[version]; exists {
+	if elem, exists := cache.items[version]; exists {
 		cache.list.MoveToBack(elem)
 		item := elem.Value.(*cacheItem)
 		item.value = dek
@@ -1022,21 +1265,20 @@ func (dm *DEKManager) addToCache(keyName string, version int, dek []byte) {
 		if cache.list.Len() >= cache.capacity {
 			oldest := cache.list.Front()
 			if oldest != nil {
-				delete(cache.keys, oldest.Value.(*cacheItem).key)
+				oldestItem := oldest.Value.(*cacheItem)
+				delete(cache.items, oldestItem.key)
 				cache.list.Remove(oldest)
 			}
 		}
 		item := &cacheItem{key: version, value: dek, timestamp: time.Now()}
 		elem := cache.list.PushBack(item)
-		cache.keys[version] = elem
+		cache.items[version] = elem
 	}
 }
 
-// Shutdown gracefully shuts down the DEK manager.
 func (dm *DEKManager) Shutdown() {
 	dm.cancel()
 
-	// Wait for goroutines to finish with a timeout
 	done := make(chan struct{})
 	go func() {
 		dm.wg.Wait()
@@ -1047,31 +1289,20 @@ func (dm *DEKManager) Shutdown() {
 	case <-done:
 		// All goroutines finished
 	case <-time.After(20 * time.Second):
-		// Timeout occurred
 		dm.logger.Warn("Shutdown timed out after 20 seconds")
 	}
 
-	// Additional 2-second wait after goroutines finish or timeout
 	time.Sleep(2 * time.Second)
 }
 
-// SchemaName returns the schema name used by the DEK manager.
-//
-// Returns:
-//   - string: The schema name.
 func (dm *DEKManager) SchemaName() string {
 	return dm.schemaName
 }
 
-// TablePrefix returns the table prefix used by the DEK manager.
-//
-// Returns:
-//   - string: The table prefix.
 func (dm *DEKManager) TablePrefix() string {
 	return dm.tablePrefix
 }
 
-// defaultLogger provides a slog-based implementation of MinimalLogger
 type defaultLogger struct {
 	logger *slog.Logger
 }
@@ -1087,3 +1318,109 @@ func newDefaultLogger() *defaultLogger {
 func (l *defaultLogger) Warn(msg string, args ...any) {
 	l.logger.Warn(msg, args...)
 }
+
+func generateAES256RandomDEK(ctx context.Context) ([]byte, error) {
+	return generateRandomDEK(32)
+}
+
+func generateAES192RandomDEK(ctx context.Context) ([]byte, error) {
+	return generateRandomDEK(24)
+}
+
+func generateAES128RandomDEK(ctx context.Context) ([]byte, error) {
+	return generateRandomDEK(16)
+}
+
+func generateRandomDEK(length int) ([]byte, error) {
+	dek := make([]byte, length)
+	if _, err := io.ReadFull(rand.Reader, dek); err != nil {
+		return nil, fmt.Errorf("failed to generate random %d-bit AES key: %w", length*8, err)
+	}
+	return dek, nil
+}
+
+// GetDEKByVersion retrieves a specific version of a DEK for the given key name using only the current MEK.
+func (dm *DEKManager) GetDEKByVersion(ctx context.Context, keyName string, version int) ([]byte, error) {
+	tx, err := dm.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var encryptedDEK string
+	var mekID int
+
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT encrypted_dek, mek_id 
+		FROM "%s"."%s_dek" 
+		WHERE key_name = $1 AND version = $2 AND mek_id = $3
+		LIMIT 1
+	`, dm.schemaName, dm.tablePrefix), keyName, version, dm.currentMEKID).Scan(&encryptedDEK, &mekID)
+
+	if err == sql.ErrNoRows {
+		return nil, fmt.Errorf("DEK not found for key %s and version %d with current MEK", keyName, version)
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to query DEK: %w", err)
+	}
+
+	dek, err := dm.decryptDEK(encryptedDEK)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decrypt DEK: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return dek, nil
+}
+
+// ListKeys returns a list of all registered key names
+func (dm *DEKManager) ListKeys(ctx context.Context) ([]string, error) {
+	rows, err := dm.db.QueryContext(ctx, fmt.Sprintf(`
+		SELECT key_name FROM "%s"."%s_key_info"
+	`, dm.schemaName, dm.tablePrefix))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query key names: %w", err)
+	}
+	defer rows.Close()
+
+	var keys []string
+	for rows.Next() {
+		var keyName string
+		if err := rows.Scan(&keyName); err != nil {
+			return nil, fmt.Errorf("failed to scan key name: %w", err)
+		}
+		keys = append(keys, keyName)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating over key names: %w", err)
+	}
+
+	return keys, nil
+}
+
+// GetKeyInfo returns information about a specific key
+func (dm *DEKManager) GetKeyInfo(ctx context.Context, keyName string) (string, int, error) {
+	var genFuncName string
+	var latestVersion int
+
+	err := dm.db.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT ki.gen_func_name, COALESCE(MAX(d.version), 0) as latest_version
+		FROM "%s"."%s_key_info" ki
+		LEFT JOIN "%s"."%s_dek" d ON ki.key_name = d.key_name
+		WHERE ki.key_name = $1
+		GROUP BY ki.gen_func_name
+	`, dm.schemaName, dm.tablePrefix, dm.schemaName, dm.tablePrefix), keyName).Scan(&genFuncName, &latestVersion)
+
+	if err == sql.ErrNoRows {
+		return "", 0, fmt.Errorf("key '%s' not found", keyName)
+	} else if err != nil {
+		return "", 0, fmt.Errorf("failed to get key info: %w", err)
+	}
+
+	return genFuncName, latestVersion, nil
+}
+
+// End of DEKManager implementation
