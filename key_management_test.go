@@ -334,6 +334,100 @@ func TestDEKManager(t *testing.T) {
 			<-ch
 		}
 	})
+
+	t.Run("RegisterKeyAndGetDEK", func(t *testing.T) {
+		manager, err := NewDEKManager(db, mek)
+		require.NoError(t, err)
+		defer manager.Shutdown()
+
+		ctx := context.Background()
+
+		// Register a new key
+		err = manager.RegisterKey(ctx, "test_key")
+		require.NoError(t, err)
+
+		// Register the same key again (should be idempotent)
+		err = manager.RegisterKey(ctx, "test_key")
+		require.NoError(t, err)
+
+		// Get a DEK for the registered key
+		dek1, version1, err := manager.GetDEK(ctx, "test_key")
+		require.NoError(t, err)
+		assert.NotNil(t, dek1)
+		assert.Equal(t, 1, version1)
+
+		// Get the same DEK again
+		dek2, version2, err := manager.GetDEK(ctx, "test_key")
+		require.NoError(t, err)
+		assert.Equal(t, dek1, dek2)
+		assert.Equal(t, version1, version2)
+
+		// Register a different key
+		err = manager.RegisterKey(ctx, "another_key")
+		require.NoError(t, err)
+
+		// Get a DEK for the new key
+		dek3, version3, err := manager.GetDEK(ctx, "another_key")
+		require.NoError(t, err)
+		assert.NotEqual(t, dek1, dek3)
+		assert.Equal(t, 1, version3)
+	})
+
+	t.Run("RegisterKeyWithSkipCache", func(t *testing.T) {
+		manager, err := NewDEKManager(db, mek)
+		require.NoError(t, err)
+		defer manager.Shutdown()
+
+		ctx := context.Background()
+
+		// Register a key
+		err = manager.RegisterKey(ctx, "skip_cache_key")
+		require.NoError(t, err)
+
+		// Register the same key with skip cache option
+		err = manager.RegisterKey(ctx, "skip_cache_key", WithSkipCache())
+		require.NoError(t, err)
+
+		// Get a DEK for the registered key
+		dek, version, err := manager.GetDEK(ctx, "skip_cache_key")
+		require.NoError(t, err)
+		assert.NotNil(t, dek)
+		assert.Equal(t, 1, version)
+	})
+
+	t.Run("KeyFunctionCaching", func(t *testing.T) {
+		manager, err := NewDEKManager(db, mek)
+		require.NoError(t, err)
+		defer manager.Shutdown()
+
+		ctx := context.Background()
+
+		// Register a key
+		err = manager.RegisterKey(ctx, "cache_test_key")
+		require.NoError(t, err)
+
+		// Get DEK to ensure the key-function is cached
+		_, _, err = manager.GetDEK(ctx, "cache_test_key")
+		require.NoError(t, err)
+
+		// Attempt to register with a different function (should fail due to cache)
+		err = manager.RegisterKeyWithFunction(ctx, "cache_test_key", "aes192-random")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "already registered with a different function")
+
+		// Register a new key with skip cache option
+		err = manager.RegisterKey(ctx, "new_cache_test_key", WithSkipCache())
+		require.NoError(t, err)
+
+		// Verify that the new key was registered successfully
+		_, _, err = manager.GetDEK(ctx, "new_cache_test_key")
+		require.NoError(t, err)
+
+		// Attempt to register the new key again with a different function (should fail because it's in the database)
+		err = manager.RegisterKeyWithFunction(ctx, "new_cache_test_key", "aes192-random")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "already registered with a different function")
+	})
 }
 
 func TestInvalidMEKSize(t *testing.T) {

@@ -30,24 +30,24 @@ go get github.com/tzahifadida/go-pg-dek-manager
 
 ```go
 import (
-    "context"
-    "database/sql"
-    "github.com/tzahifadida/go-pg-dek-manager"
+"context"
+"database/sql"
+"github.com/tzahifadida/go-pg-dek-manager"
 )
 
 db, err := sql.Open("postgres", "your_connection_string")
 if err != nil {
-    // Handle error
+// Handle error
 }
 
 mek := []byte("your-32-byte-master-encryption-key")
 
 manager, err := gopgdekmanager.NewDEKManager(db, mek,
-    gopgdekmanager.WithCleanupPeriod(180*24*time.Hour),
-    gopgdekmanager.WithDEKRotationPeriod(30*24*time.Hour),
+gopgdekmanager.WithCleanupPeriod(180*24*time.Hour),
+gopgdekmanager.WithDEKRotationPeriod(30*24*time.Hour),
 )
 if err != nil {
-    // Handle error
+// Handle error
 }
 defer manager.Shutdown()
 ```
@@ -58,7 +58,13 @@ defer manager.Shutdown()
 ctx := context.Background()
 err := manager.RegisterKey(ctx, "user_data")
 if err != nil {
-    // Handle error
+// Handle error
+}
+
+// To skip the key-function cache during registration:
+err = manager.RegisterKey(ctx, "user_data", gopgdekmanager.WithSkipCache())
+if err != nil {
+// Handle error
 }
 ```
 
@@ -128,6 +134,14 @@ if err != nil {
 - `WithFunction(name string, fn DEKGenerationFunc)`: Add a custom DEK generation function.
 - `WithDefaultGenFuncName(name string)`: Set the default DEK generation function name.
 - `WithMaxKeyFuncCache(size int)`: Set the maximum size for the key-function cache.
+- `WithSkipCache()`: Skip the key-function cache during key registration (use with `RegisterKey`).
+
+## Key-Function Caching
+
+- The DEKManager caches the association between keys and their generation functions for improved performance.
+- By default, key registration checks this cache before querying the database.
+- Use `WithSkipCache()` when registering a key to bypass this cache and always check the database.
+- This can be useful in scenarios where you want to ensure the most up-to-date key information is used.
 
 ## MEK Handling
 
@@ -144,6 +158,7 @@ if err != nil {
 5. **Access Control**: Implement strict access controls to the database and key management functions.
 6. **Key Registration**: Always register keys before attempting to get or rotate DEKs.
 7. **Version Management**: When encrypting data, store the DEK version along with the encrypted data to ensure correct decryption later.
+8. **Cache Management**: Use `WithSkipCache()` judiciously, typically in scenarios where you need to ensure the most recent key information is used.
 
 ## Distributed Environment Considerations
 

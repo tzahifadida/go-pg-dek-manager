@@ -570,6 +570,90 @@ func (dm *DEKManager) hashMEK(mek []byte) string {
 	return base64.StdEncoding.EncodeToString(hash[:])
 }
 
+type RegisterKeyOption func(*registerKeyOptions)
+
+type registerKeyOptions struct {
+	skipCache bool
+}
+
+func WithSkipCache() RegisterKeyOption {
+	return func(opts *registerKeyOptions) {
+		opts.skipCache = true
+	}
+}
+
+func (dm *DEKManager) RegisterKey(ctx context.Context, keyName string, opts ...RegisterKeyOption) error {
+	options := &registerKeyOptions{}
+	for _, opt := range opts {
+		opt(options)
+	}
+
+	if !options.skipCache {
+		dm.keyFuncCache.mutex.RLock()
+		_, exists := dm.keyFuncCache.items[keyName]
+		dm.keyFuncCache.mutex.RUnlock()
+		if exists {
+			return nil // Key is already registered
+		}
+	}
+
+	// Proceed with registration
+	return dm.RegisterKeyWithFunction(ctx, keyName, dm.defaultGenFuncName)
+}
+
+func (dm *DEKManager) RegisterKeyWithFunction(ctx context.Context, keyName, genFuncName string) error {
+	dm.dekGenMutex.RLock()
+	_, exists := dm.dekGenFuncs[genFuncName]
+	dm.dekGenMutex.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("DEK generation function '%s' not registered", genFuncName)
+	}
+
+	tx, err := dm.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	var existingFuncName string
+	err = tx.QueryRowContext(ctx, fmt.Sprintf(`
+		SELECT gen_func_name FROM "%s"."%s_key_info"
+		WHERE key_name = $1
+	`, dm.schemaName, dm.tablePrefix), keyName).Scan(&existingFuncName)
+
+	if err == nil {
+		// Key already exists
+		if existingFuncName != genFuncName {
+			return fmt.Errorf("key '%s' already registered with a different function: %s", keyName, existingFuncName)
+		}
+		// Key exists with the same function, this is a successful idempotent operation
+		dm.keyFuncCache.Add(keyName, genFuncName)
+		return tx.Commit()
+	} else if err != sql.ErrNoRows {
+		return fmt.Errorf("failed to check existing key: %w", err)
+	}
+
+	// Key doesn't exist, insert new entry
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		INSERT INTO "%s"."%s_key_info" (key_name, gen_func_name)
+		VALUES ($1, $2)
+	`, dm.schemaName, dm.tablePrefix), keyName, genFuncName)
+
+	if err != nil {
+		return fmt.Errorf("failed to register key: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	// Update the cache
+	dm.keyFuncCache.Add(keyName, genFuncName)
+
+	return nil
+}
+
 func (dm *DEKManager) GetDEK(ctx context.Context, keyName string) ([]byte, int, error) {
 	if !dm.isCurrentMEK {
 		dm.logger.Warn("Using an old version of MEK to retrieve DEK.", "key_name", keyName)
@@ -742,111 +826,6 @@ func (dm *DEKManager) decryptDEKWithMEK(mek []byte, encryptedDEK string) ([]byte
 	}
 
 	return plaintext, nil
-}
-
-func (dm *DEKManager) RegisterKeyWithFunction(ctx context.Context, keyName, genFuncName string) error {
-	dm.dekGenMutex.RLock()
-	_, exists := dm.dekGenFuncs[genFuncName]
-	dm.dekGenMutex.RUnlock()
-
-	if !exists {
-		return fmt.Errorf("DEK generation function '%s' not registered", genFuncName)
-	}
-
-	tx, err := dm.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	var existingFuncName string
-	err = tx.QueryRowContext(ctx, fmt.Sprintf(`
-		SELECT gen_func_name FROM "%s"."%s_key_info"
-		WHERE key_name = $1
-	`, dm.schemaName, dm.tablePrefix), keyName).Scan(&existingFuncName)
-
-	if err == nil {
-		// Key already exists
-		if existingFuncName != genFuncName {
-			return fmt.Errorf("key '%s' already registered with a different function: %s", keyName, existingFuncName)
-		}
-		// Key exists with the same function, this is a successful idempotent operation
-		return tx.Commit()
-	} else if err != sql.ErrNoRows {
-		return fmt.Errorf("failed to check existing key: %w", err)
-	}
-
-	// Key doesn't exist, insert new entry
-	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
-		INSERT INTO "%s"."%s_key_info" (key_name, gen_func_name)
-		VALUES ($1, $2)
-	`, dm.schemaName, dm.tablePrefix), keyName, genFuncName)
-
-	if err != nil {
-		return fmt.Errorf("failed to register key: %w", err)
-	}
-
-	return tx.Commit()
-}
-
-func (dm *DEKManager) RegisterKey(ctx context.Context, keyName string) error {
-	return dm.RegisterKeyWithFunction(ctx, keyName, dm.defaultGenFuncName)
-}
-
-func (dm *DEKManager) RemoveKey(ctx context.Context, keyName string) error {
-	tx, err := dm.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	// Remove from DEKs table
-	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
-		DELETE FROM "%s"."%s_dek"
-		WHERE key_name = $1
-	`, dm.schemaName, dm.tablePrefix), keyName)
-	if err != nil {
-		return fmt.Errorf("failed to remove DEKs for key '%s': %w", keyName, err)
-	}
-
-	// Remove from key_info table
-	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
-		DELETE FROM "%s"."%s_key_info"
-		WHERE key_name = $1
-	`, dm.schemaName, dm.tablePrefix), keyName)
-	if err != nil {
-		return fmt.Errorf("failed to remove key info for key '%s': %w", keyName, err)
-	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-
-	if rowsAffected == 0 {
-		return fmt.Errorf("key '%s' not found", keyName)
-	}
-
-	// Commit the transaction
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	// Remove from DEK cache
-	dm.removeFromCache(keyName)
-
-	// Remove from key-function cache
-	dm.keyFuncCache.Remove(keyName)
-
-	dm.logger.Warn("Key removed successfully", "key_name", keyName)
-
-	return nil
-}
-
-func (dm *DEKManager) removeFromCache(keyName string) {
-	dm.cacheMutex.Lock()
-	defer dm.cacheMutex.Unlock()
-	delete(dm.caches, keyName)
 }
 
 func (dm *DEKManager) RotateDEK(ctx context.Context, keyName string) error {
@@ -1108,6 +1087,62 @@ func (dm *DEKManager) cleanupOldDEKs() error {
 	return nil
 }
 
+func (dm *DEKManager) RemoveKey(ctx context.Context, keyName string) error {
+	tx, err := dm.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Remove from DEKs table
+	_, err = tx.ExecContext(ctx, fmt.Sprintf(`
+		DELETE FROM "%s"."%s_dek"
+		WHERE key_name = $1
+	`, dm.schemaName, dm.tablePrefix), keyName)
+	if err != nil {
+		return fmt.Errorf("failed to remove DEKs for key '%s': %w", keyName, err)
+	}
+
+	// Remove from key_info table
+	result, err := tx.ExecContext(ctx, fmt.Sprintf(`
+		DELETE FROM "%s"."%s_key_info"
+		WHERE key_name = $1
+	`, dm.schemaName, dm.tablePrefix), keyName)
+	if err != nil {
+		return fmt.Errorf("failed to remove key info for key '%s': %w", keyName, err)
+	}
+
+	rowsAffected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if rowsAffected == 0 {
+		return fmt.Errorf("key '%s' not found", keyName)
+	}
+
+	// Commit the transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	// Remove from DEK cache
+	dm.removeFromCache(keyName)
+
+	// Remove from key-function cache
+	dm.keyFuncCache.Remove(keyName)
+
+	dm.logger.Warn("Key removed successfully", "key_name", keyName)
+
+	return nil
+}
+
+func (dm *DEKManager) removeFromCache(keyName string) {
+	dm.cacheMutex.Lock()
+	defer dm.cacheMutex.Unlock()
+	delete(dm.caches, keyName)
+}
+
 func (dm *DEKManager) periodicTransitionCheck() {
 	defer dm.wg.Done()
 	ticker := time.NewTicker(dm.transitionCheckPeriod)
@@ -1170,7 +1205,7 @@ type oldDEKInfo struct {
 
 func (dm *DEKManager) fetchOldDEKs(tx *sqlx.Tx) ([]oldDEKInfo, error) {
 	query := fmt.Sprintf(`
-        SELECT key_name, encrypted_dek, version
+		SELECT key_name, encrypted_dek, version
 		FROM "%s"."%s_dek" 
 		WHERE mek_id = $1
 		ORDER BY key_name, version
@@ -1339,7 +1374,6 @@ func generateRandomDEK(length int) ([]byte, error) {
 	return dek, nil
 }
 
-// GetDEKByVersion retrieves a specific version of a DEK for the given key name using only the current MEK.
 func (dm *DEKManager) GetDEKByVersion(ctx context.Context, keyName string, version int) ([]byte, error) {
 	tx, err := dm.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1375,7 +1409,6 @@ func (dm *DEKManager) GetDEKByVersion(ctx context.Context, keyName string, versi
 	return dek, nil
 }
 
-// ListKeys returns a list of all registered key names
 func (dm *DEKManager) ListKeys(ctx context.Context) ([]string, error) {
 	rows, err := dm.db.QueryContext(ctx, fmt.Sprintf(`
 		SELECT key_name FROM "%s"."%s_key_info"
@@ -1401,7 +1434,6 @@ func (dm *DEKManager) ListKeys(ctx context.Context) ([]string, error) {
 	return keys, nil
 }
 
-// GetKeyInfo returns information about a specific key
 func (dm *DEKManager) GetKeyInfo(ctx context.Context, keyName string) (string, int, error) {
 	var genFuncName string
 	var latestVersion int
@@ -1422,5 +1454,3 @@ func (dm *DEKManager) GetKeyInfo(ctx context.Context, keyName string) (string, i
 
 	return genFuncName, latestVersion, nil
 }
-
-// End of DEKManager implementation
